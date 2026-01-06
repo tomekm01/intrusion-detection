@@ -178,17 +178,28 @@ def run_s3_combined(datasets, results):
 
 
 # --- S4: STREAM WITH RETRAINING (Hybrid Solution) ---
+# --- ZMODYFIKOWANE S4: SZYBSZE DZIAŁANIE ---
 def run_s4_stream(datasets):
-    print(f"\n--- Running S4: Stream Simulation (Retrain={RETRAIN_ON_EACH_BATCH}) ---")
+    # --- USTAWIENIA (Szybkość i Wygląd) ---
+    RETRAIN_INTERVAL = 10  # Douczanie co 10-tą paczkę
+    BATCH_SIZE_S4 = 2000  # Rozmiar paczki
+    WINDOW_SIZE = 50000  # Ile ostatnich próbek pamiętać (żeby RAM nie wybuchł)
+
+    print(f"\n--- Running S4: Stream Simulation (Retrain Interval={RETRAIN_INTERVAL}) ---")
+
     dataset_names = list(datasets.keys())
     stream_results = []
 
+    # === CZĘŚĆ OBLICZENIOWA (Ta sama co wcześniej, zoptymalizowana) ===
     for test_name in dataset_names:
-        # 1. Przygotowanie danych treningowych (wszystkie poza testowym)
         train_dfs = [df for name, df in datasets.items() if name != test_name]
         if not train_dfs: continue
 
         combined_train = pd.concat(train_dfs, ignore_index=True)
+        # Optymalizacja startowa
+        if len(combined_train) > 50000:
+            combined_train = combined_train.sample(50000, random_state=42)
+
         X_train_initial = combined_train.drop('label', axis=1)
         y_train_initial = combined_train['label']
 
@@ -196,46 +207,35 @@ def run_s4_stream(datasets):
         X_stream = target_df.drop('label', axis=1)
         y_stream = target_df['label']
 
-        print(f"  > Streaming: {test_name} (Initial train size: {len(X_train_initial)})")
+        print(f"  > Streaming on: {test_name} (Size: {len(X_stream)})")
 
-        # 2. Inicjalizacja modeli
-        # Używamy jednego zestawu modeli na strumień
-        models = get_models(seed=RANDOM_STATE)
-
-        # Słownik do przechowywania aktualnego stanu danych treningowych dla każdego modelu
-        # (Większość modeli w sklearn nie wspiera partial_fit idealnie, więc refitujemy na rosnącym zbiorze)
+        models = get_models(seed=42)
         training_sets = {}
+
+        # Initial fit
         for m_name in models:
-            training_sets[m_name] = {
-                'X': X_train_initial.copy(),
-                'y': y_train_initial.copy()
-            }
-            # Initial fit
+            training_sets[m_name] = {'X': X_train_initial.copy(), 'y': y_train_initial.copy()}
             if 'IsolationForest' in m_name:
                 models[m_name].fit(X_train_initial)
             else:
                 models[m_name].fit(X_train_initial, y_train_initial)
 
-        # 3. Pętla strumienia
-        n_batches = int(np.ceil(len(X_stream) / STREAM_BATCH_SIZE))
+        n_batches = int(np.ceil(len(X_stream) / BATCH_SIZE_S4))
 
+        # Pętla po paczkach
         for i in range(n_batches):
-            start_idx = i * STREAM_BATCH_SIZE
-            end_idx = min((i + 1) * STREAM_BATCH_SIZE, len(X_stream))
+            start_idx = i * BATCH_SIZE_S4
+            end_idx = min((i + 1) * BATCH_SIZE_S4, len(X_stream))
 
             X_batch = X_stream.iloc[start_idx:end_idx]
             y_batch = y_stream.iloc[start_idx:end_idx]
 
-            # Jeśli batch ma < 2 klasy, F1 score może rzucić warning, ale obsłużymy to
-            if len(y_batch.unique()) < 2:
-                # Opcjonalnie można pominąć batch, ale dla ciągłości wykresu zostawiamy
-                pass
+            if len(y_batch.unique()) < 2: pass
 
             for model_name, model in models.items():
-                # A. Ewaluacja (Przed treningiem!)
+                # 1. Ewaluacja
                 preds = get_predictions(model, X_batch, model_name)
                 f1 = f1_score(y_batch, preds, zero_division=0)
-
                 stream_results.append({
                     'Test_Stream': test_name,
                     'Model': model_name,
@@ -243,47 +243,74 @@ def run_s4_stream(datasets):
                     'F1-Score': f1
                 })
 
-                # B. Retraining (Douczanie) - Jeśli włączone
-                if RETRAIN_ON_EACH_BATCH:
-                    # Dodajemy batch do historii treningowej
+                # 2. Douczanie (co 10 paczek)
+                if RETRAIN_ON_EACH_BATCH and (i % RETRAIN_INTERVAL == 0):
                     current_X = pd.concat([training_sets[model_name]['X'], X_batch], ignore_index=True)
                     current_y = pd.concat([training_sets[model_name]['y'], y_batch], ignore_index=True)
 
-                    # Aktualizacja referencji
+                    # Limit pamięci (Windowing)
+                    if len(current_X) > WINDOW_SIZE:
+                        current_X = current_X.iloc[-WINDOW_SIZE:]
+                        current_y = current_y.iloc[-WINDOW_SIZE:]
+
                     training_sets[model_name]['X'] = current_X
                     training_sets[model_name]['y'] = current_y
 
-                    # Re-fit modelu na powiększonym zbiorze
-                    # Uwaga: To jest kosztowne obliczeniowo, ale daje najlepszą dokładność "online"
                     if 'IsolationForest' in model_name:
                         model.fit(current_X)
                     else:
                         model.fit(current_X, current_y)
 
-    # 4. Wizualizacja wyników strumienia
+            # Kropka co 5 batchy, żeby nie śmiecić w konsoli
+            if i % 5 == 0: print(".", end="", flush=True)
+        print(" Done!")
+
+    # === CZĘŚĆ WIZUALIZACYJNA (Nowa logika) ===
     if stream_results:
         df_stream = pd.DataFrame(stream_results)
+
+        # --- TYP 1: Jeden plik na każdy ZBIÓR DANYCH (Porównanie Modeli) ---
+        print("\nGenerowanie wykresów wg ZBIORÓW DANYCH...")
         unique_streams = df_stream['Test_Stream'].unique()
 
-        plt.figure(figsize=(12, 4 * len(unique_streams)))
-        for idx, stream in enumerate(unique_streams):
-            plt.subplot(len(unique_streams), 1, idx + 1)
+        for stream in unique_streams:
+            plt.figure(figsize=(10, 6))
             subset = df_stream[df_stream['Test_Stream'] == stream]
+
             sns.lineplot(data=subset, x='Batch_Idx', y='F1-Score', hue='Model', marker='o')
 
-            title = f'Stream: {stream}'
-            if RETRAIN_ON_EACH_BATCH:
-                title += ' (with Incremental Retraining)'
-            else:
-                title += ' (Static Model)'
-
-            plt.title(title)
+            plt.title(f'Wyniki dla zbioru: {stream}')
             plt.ylabel('F1 Score')
+            plt.xlabel('Upływ czasu (Batch Index)')
             plt.grid(True, alpha=0.3)
+            plt.ylim(0, 1.05)  # Sztywna skala Y, żeby łatwiej porównywać
 
-        plt.tight_layout()
-        plt.savefig(STREAM_PLOT_FILE)
-        print(f"Stream plot saved to {STREAM_PLOT_FILE}")
+            filename = f'plot_stream_by_DATA_{stream}.png'
+            plt.savefig(filename)
+            plt.close()  # Ważne: zamykamy wykres, żeby nie nakładał się na następny
+            print(f"  > Zapisano: {filename}")
+
+        # --- TYP 2: Jeden plik na każdy MODEL (Porównanie Zbiorów) ---
+        print("\nGenerowanie wykresów wg MODELI...")
+        unique_models = df_stream['Model'].unique()
+
+        for model in unique_models:
+            plt.figure(figsize=(10, 6))
+            subset = df_stream[df_stream['Model'] == model]
+
+            # Tu 'hue' to Test_Stream, bo chcemy widzieć jak model radzi sobie na różnych danych
+            sns.lineplot(data=subset, x='Batch_Idx', y='F1-Score', hue='Test_Stream', marker='s')
+
+            plt.title(f'Stabilność modelu: {model}')
+            plt.ylabel('F1 Score')
+            plt.xlabel('Upływ czasu (Batch Index)')
+            plt.grid(True, alpha=0.3)
+            plt.ylim(0, 1.05)
+
+            filename = f'plot_stream_by_MODEL_{model}.png'
+            plt.savefig(filename)
+            plt.close()
+            print(f"  > Zapisano: {filename}")
 
 
 def main():
@@ -295,21 +322,21 @@ def main():
     results = []
 
     # Scenarios 1-3
-    run_s1_baseline(datasets, results)
-    run_s2_transfer(datasets, results)
-    run_s3_combined(datasets, results)
+    #run_s1_baseline(datasets, results)
+    #run_s2_transfer(datasets, results)
+    #run_s3_combined(datasets, results)
 
     # Save S1-S3 Results
-    results_df = pd.DataFrame(results)
+    #results_df = pd.DataFrame(results)
     # Zapisz pełne wyniki (surowe)
-    results_df.to_csv('experiment_results_raw.csv', index=False)
+    #results_df.to_csv('experiment_results_raw.csv', index=False)
 
     # Zapisz wyniki zagregowane (Mean/Std)
-    summary = results_df.groupby(['Scenario', 'Train_Set', 'Test_Set', 'Model'])['F1-Score'].agg(
-        ['mean', 'std']).reset_index()
-    summary.to_csv(RESULTS_FILE, index=False)
-    print(f"\nAggregated results saved to {RESULTS_FILE}")
-    print(summary.head())
+    #summary = results_df.groupby(['Scenario', 'Train_Set', 'Test_Set', 'Model'])['F1-Score'].agg(
+        #['mean', 'std']).reset_index()
+    #summary.to_csv(RESULTS_FILE, index=False)
+    #print(f"\nAggregated results saved to {RESULTS_FILE}")
+    #print(summary.head())
 
     # Scenario 4 (Stream)
     run_s4_stream(datasets)
