@@ -1,0 +1,143 @@
+1. Problem "Jednorodnych Batchy" (Monoclass Batches)Najważniejszą przyczyną jest to, że dane w pliku KDD są prawdopodobnie posortowane
+(np. najpierw 50 tysięcy rekordów ruchu normalnego, potem 10 tysięcy ataku Neptune, potem znowu normalne, itd.).
+Twoja pętla strumienia (run_s4_stream) bierze dane sekwencyjnie (iloc[start:end]), bez wcześniejszego przetasowania (shuffle) zbioru testowego.
+W rezultacie trafiasz na batche, które wyglądają tak:Batch X: 1000 rekordów klasy Normal (0).Batch Y: 1000 rekordów klasy Attack (1).2.
+Matematyka F1-Score (Dlaczego wynik spada do 0?)Gdy model trafia na batch, w którym nie ma ani jednego ataku (same etykiety 0), metryka F1-Score matematycznie "wariuje" lub zeruje się, w zależności od implementacji.
+Wzór na F1 to:$$F1 = \frac{TP}{TP + 0.5(FP + FN)}$$Jeżeli w prawdziwych danych (y_batch) są same zera (brak ataków):
+Liczba True Positive (TP) musi wynosić 0 (bo nie ma czego wykryć).Jeżeli TP = 0, to licznik ułamka wynosi 0.Wynik F1 wynosi 0.0, nawet jeśli model poprawnie przewidział,
+ że wszystko jest bezpieczne (True Negative nie jest uwzględniane w liczniku F1).W Twoim kodzie masz f1_score(..., zero_division=0). Dlatego za każdym razem,
+ gdy trafiasz na "czysty" ruch sieciowy (batch bez ataków), wykres spada do zera, co widać jako te długie doliny na wykresie.
+ 3. Specyfika ataków w KDD (Blocky nature)Zbiór KDD słynie z tego, że ataki występują w ogromnych blokach.
+  Np. atak typu DoS (Smurf, Neptune) generuje tysiące pakietów w krótkim czasie.Gdy wchodzi blok ataku DoS (łatwego do wykrycia),
+  modele mają F1 = 1.0 (górna linia na wykresie).Gdy wchodzi blok ruchu normalnego, F1 spada do 0.0 (z powodu opisanego w pkt 2).
+  Gdy wchodzi trudniejszy atak (np. U2R - User to Root),
+modele mogą mieć realny spadek skuteczności (pośrednie wartości), ale w KDD dominują masowe ataki DoS.
+
+Aggregated results saved to experiment_results_final.csv
+      Scenario Train_Set Test_Set                  Model      mean       std
+0  S1_Baseline     CORES    CORES  M1_LogisticRegression  0.961240  0.000246
+1  S1_Baseline     CORES    CORES             M2_XGBoost  0.961250  0.000250
+2  S1_Baseline     CORES    CORES     M3_IsolationForest  0.183684  0.009057
+3  S1_Baseline       KDD      KDD  M1_LogisticRegression  0.965410  0.000554
+4  S1_Baseline       KDD      KDD             M2_XGBoost  0.984117  0.000566
+
+--- Running S4: Stream (Controlled Retraining + FIFO Window) ---
+  > Initial Base: [CORES+NETFLOW] (Size: 500000) -> Stream: KDD
+    Training initial M1_LogisticRegression... Done.
+    Training initial M2_XGBoost... Done.
+    Training initial M3_IsolationForest... Done.
+.......
+    [Retrain] M1_LogisticRegression | batch=35 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=35 | train_size=100000 Done.
+........
+    [Retrain] M1_LogisticRegression | batch=75 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=75 | train_size=100000 Done.
+.
+    [Retrain] M1_LogisticRegression | batch=80 | train_size=100000 Done.
+
+    [Retrain] M2_XGBoost | batch=80 | train_size=100000 Done.
+..
+    [Retrain] M1_LogisticRegression | batch=90 | train_size=100000 Done.
+
+    [Retrain] M2_XGBoost | batch=90 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=90 | train_size=100000 Done.
+.
+    [Retrain] M3_IsolationForest | batch=95 | train_size=100000 Done.
+........
+    [Retrain] M1_LogisticRegression | batch=135 | train_size=100000 Done.
+
+    [Retrain] M2_XGBoost | batch=135 | train_size=100000 Done.
+..
+    [Retrain] M1_LogisticRegression | batch=145 | train_size=100000 Done.
+
+    [Retrain] M2_XGBoost | batch=145 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=145 | train_size=100000 Done.
+.
+    [Retrain] M3_IsolationForest | batch=150 | train_size=100000 Done.
+............
+    [Retrain] M1_LogisticRegression | batch=210 | train_size=100000 Done.
+.
+    [Retrain] M2_XGBoost | batch=215 | train_size=100000 Done.
+..
+    [Retrain] M1_LogisticRegression | batch=225 | train_size=100000 Done.
+.
+    [Retrain] M2_XGBoost | batch=230 | train_size=100000 Done.
+...........
+    [Retrain] M2_XGBoost | batch=285 | train_size=100000 Done.
+.
+    [Retrain] M1_LogisticRegression | batch=290 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=290 | train_size=100000 Done.
+....
+    [Retrain] M2_XGBoost | batch=310 | train_size=100000 Done.
+. Stream Done!
+  > Initial Base: [KDD+NETFLOW] (Size: 500000) -> Stream: CORES
+    Training initial M1_LogisticRegression... Done.
+    Training initial M2_XGBoost... Done.
+    Training initial M3_IsolationForest... Done.
+...................................................
+    [Retrain] M1_LogisticRegression | batch=255 | train_size=100000 Done.
+
+    [Retrain] M2_XGBoost | batch=255 | train_size=100000 Done.
+
+    [Retrain] M3_IsolationForest | batch=255 | train_size=100000 Done.
+................................................. Stream Done!
+  > Initial Base: [KDD+CORES] (Size: 500000) -> Stream: NETFLOW
+    Training initial M1_LogisticRegression... Done.
+    Training initial M2_XGBoost... Done.
+    Training initial M3_IsolationForest... Done.
+.........
+    [Retrain] M2_XGBoost | batch=45 | train_size=100000 Done.
+.............................
+    [Retrain] M2_XGBoost | batch=190 | train_size=100000 Done.
+..............
+    [Retrain] M1_LogisticRegression | batch=260 | train_size=100000 Done.
+....................
+    [Retrain] M1_LogisticRegression | batch=360 | train_size=100000 Done.
+............
+    [Retrain] M2_XGBoost | batch=420 | train_size=100000 Done.
+..
+    [Retrain] M1_LogisticRegression | batch=430 | train_size=100000 Done.
+..........
+    [Retrain] M2_XGBoost | batch=480 | train_size=100000 Done.
+.... Stream Done!
+
+ Generating Datastreams plots
+ Saved plot_stream_by_DATA_KDD.png
+ Saved plot_stream_by_DATA_CORES.png
+ Saved plot_stream_by_DATA_NETFLOW.png
+
+ Generating Model Plots
+ Saved plot_stream_by_MODEL_M1_LogisticRegression.png
+ Saved plot_stream_by_MODEL_M2_XGBoost.png
+ Saved plot_stream_by_MODEL_M3_IsolationForest.png
+
+================================================================================
+ S4 STREAM STATISTICS SUMMARY
+================================================================================
+
+Dataset Stream: KDD
+Model                     | Mean F1  | Max F1   (Batch) | Min F1   (Batch)
+---------------------------------------------------------------------------
+M1_LogisticRegression     | 0.6209   | 1.0000   (  1) | 0.0000   (104)
+M2_XGBoost                | 0.4867   | 1.0000   (103) | 0.0000   (  1)
+M3_IsolationForest        | 0.5731   | 1.0000   (  1) | 0.0000   ( 36)
+
+Dataset Stream: CORES
+Model                     | Mean F1  | Max F1   (Batch) | Min F1   (Batch)
+---------------------------------------------------------------------------
+M1_LogisticRegression     | 0.7040   | 0.7484   (281) | 0.6559   (166)
+M2_XGBoost                | 0.8236   | 0.9763   (403) | 0.6493   ( 65)
+M3_IsolationForest        | 0.6908   | 0.7489   (281) | 0.6352   (250)
+
+Dataset Stream: NETFLOW
+Model                     | Mean F1  | Max F1   (Batch) | Min F1   (Batch)
+---------------------------------------------------------------------------
+M1_LogisticRegression     | 0.6053   | 0.6551   (366) | 0.5544   (238)
+M2_XGBoost                | 0.6222   | 0.7077   (489) | 0.2768   ( 45)
+M3_IsolationForest        | 0.7103   | 0.7523   (370) | 0.6693   (420)
+================================================================================

@@ -11,10 +11,8 @@ from xgboost import XGBClassifier
 import os
 import warnings
 
-# --- KONFIGURACJA ---
 warnings.filterwarnings('ignore')
 
-# Ścieżki do plików (zgodne z Twoim skryptem przetwarzającym)
 DATA_FILES = {
     'KDD': '../data/processed/processed_kdd.csv',
     'CORES': '../data/processed/processed_cores.csv',
@@ -24,14 +22,10 @@ DATA_FILES = {
 RESULTS_FILE = 'experiment_results_final.csv'
 STREAM_PLOT_FILE = 'stream_learning_process.png'
 
-# Parametry walidacji
+# RKF parameters
 N_SPLITS = 5
 N_REPEATS = 2
 RANDOM_STATE = 42
-
-# Parametry Strumienia (S4)
-STREAM_BATCH_SIZE = 500  # Rozmiar paczki danych w strumieniu
-RETRAIN_ON_EACH_BATCH = True  # TRUE = model doucza się na każdej nowej paczce (logika z Kodu 1)
 
 
 def get_models(seed=RANDOM_STATE):
@@ -66,13 +60,11 @@ def load_data():
         if os.path.exists(path):
             print(f"Loading {name} from {path}...")
             df = pd.read_csv(path)
-            # Zabezpieczenie na wypadek nieskończoności z logarytmów
             df = df.replace([np.inf, -np.inf], 0)
             datasets[name] = df
         else:
             print(f"WARNING: {path} not found. Ensure you ran the processing script first.")
     return datasets
-
 
 # --- S1: BASELINE (Repeated K-Fold) ---
 def run_s1_baseline(datasets, results):
@@ -149,16 +141,13 @@ def run_s3_combined(datasets, results):
     for test_name in dataset_names:
         train_dfs = [df for name, df in datasets.items() if name != test_name]
         if not train_dfs: continue
-
         combined_train = pd.concat(train_dfs, ignore_index=True)
         train_source_names = "+".join([name for name in dataset_names if name != test_name])
         print(f"  > Train: [{train_source_names}] -> Test: {test_name}")
-
         X_train = combined_train.drop('label', axis=1)
         y_train = combined_train['label']
         X_test = datasets[test_name].drop('label', axis=1)
         y_test = datasets[test_name]['label']
-
         for i in range(N_REPEATS):
             models = get_models(seed=RANDOM_STATE + i)
             for model_name, model in models.items():
@@ -166,7 +155,6 @@ def run_s3_combined(datasets, results):
                     model.fit(X_train)
                 else:
                     model.fit(X_train, y_train)
-
                 preds = get_predictions(model, X_test, model_name)
                 metrics = calculate_metrics(y_test, preds)
                 results.append({
@@ -178,27 +166,31 @@ def run_s3_combined(datasets, results):
 
 
 # --- S4: STREAM WITH RETRAINING (Hybrid Solution) ---
-# --- ZMODYFIKOWANE S4: SZYBSZE DZIAŁANIE ---
 def run_s4_stream(datasets):
-    # --- USTAWIENIA (Szybkość i Wygląd) ---
-    RETRAIN_INTERVAL = 10  # Douczanie co 10-tą paczkę
-    BATCH_SIZE_S4 = 2000  # Rozmiar paczki
-    WINDOW_SIZE = 50000  # Ile ostatnich próbek pamiętać (żeby RAM nie wybuchł)
+    MAX_INITIAL = 500_000  # losowa próbka do initial training
+    MAX_BATCHES = 500  # maksymalnie batchy
+    RETRAIN_ON_EACH_BATCH = True
+    RETRAIN_INTERVAL = 5  # interwał sprawdzania
+    RETRAIN_ON_DROP_THRESH = 0.05  # próg spadku
+    BATCH_SIZE_S4 = 1000
+    WINDOW_SIZE = 100_000  # wielkość okna przesuwnego (FIFO)
 
-    print(f"\n--- Running S4: Stream Simulation (Retrain Interval={RETRAIN_INTERVAL}) ---")
-
+    print(f"\n--- Running S4: Stream (Controlled Retraining + FIFO Window) ---")
     dataset_names = list(datasets.keys())
     stream_results = []
 
-    # === CZĘŚĆ OBLICZENIOWA (Ta sama co wcześniej, zoptymalizowana) ===
     for test_name in dataset_names:
         train_dfs = [df for name, df in datasets.items() if name != test_name]
-        if not train_dfs: continue
+        if not train_dfs:
+            continue
 
         combined_train = pd.concat(train_dfs, ignore_index=True)
-        # Optymalizacja startowa
-        if len(combined_train) > 50000:
-            combined_train = combined_train.sample(50000, random_state=42)
+
+        # === OGRANICZENIE INITIAL TRAINING ===
+        if len(combined_train) > MAX_INITIAL:
+            combined_train = combined_train.sample(n=MAX_INITIAL, random_state=42).reset_index(drop=True)
+
+        train_source_names = "+".join([name for name in dataset_names if name != test_name])
 
         X_train_initial = combined_train.drop('label', axis=1)
         y_train_initial = combined_train['label']
@@ -207,35 +199,39 @@ def run_s4_stream(datasets):
         X_stream = target_df.drop('label', axis=1)
         y_stream = target_df['label']
 
-        print(f"  > Streaming on: {test_name} (Size: {len(X_stream)})")
+        print(f"  > Initial Base: [{train_source_names}] (Size: {len(X_train_initial)}) -> Stream: {test_name}")
 
         models = get_models(seed=42)
         training_sets = {}
+        last_f1 = {}
 
-        # Initial fit
-        for m_name in models:
-            training_sets[m_name] = {'X': X_train_initial.copy(), 'y': y_train_initial.copy()}
+        for m_name, model in models.items():
+            training_sets[m_name] = {
+                'X': X_train_initial.copy().reset_index(drop=True),
+                'y': y_train_initial.copy().reset_index(drop=True)
+            }
+            last_f1[m_name] = None
+
+            print(f"    Training initial {m_name}...", end=" ")
             if 'IsolationForest' in m_name:
-                models[m_name].fit(X_train_initial)
+                model.fit(X_train_initial)
             else:
-                models[m_name].fit(X_train_initial, y_train_initial)
+                model.fit(X_train_initial, y_train_initial)
+            print("Done.")
 
         n_batches = int(np.ceil(len(X_stream) / BATCH_SIZE_S4))
+        n_batches = min(n_batches, MAX_BATCHES)
 
-        # Pętla po paczkach
         for i in range(n_batches):
             start_idx = i * BATCH_SIZE_S4
             end_idx = min((i + 1) * BATCH_SIZE_S4, len(X_stream))
-
-            X_batch = X_stream.iloc[start_idx:end_idx]
-            y_batch = y_stream.iloc[start_idx:end_idx]
-
-            if len(y_batch.unique()) < 2: pass
+            X_batch = X_stream.iloc[start_idx:end_idx].reset_index(drop=True)
+            y_batch = y_stream.iloc[start_idx:end_idx].reset_index(drop=True)
 
             for model_name, model in models.items():
-                # 1. Ewaluacja
                 preds = get_predictions(model, X_batch, model_name)
                 f1 = f1_score(y_batch, preds, zero_division=0)
+
                 stream_results.append({
                     'Test_Stream': test_name,
                     'Model': model_name,
@@ -243,75 +239,115 @@ def run_s4_stream(datasets):
                     'F1-Score': f1
                 })
 
-                # 2. Douczanie (co 10 paczek)
+                # === LOGIKA RETRAININGU ===
+                do_retrain = False
                 if RETRAIN_ON_EACH_BATCH and (i % RETRAIN_INTERVAL == 0):
-                    current_X = pd.concat([training_sets[model_name]['X'], X_batch], ignore_index=True)
-                    current_y = pd.concat([training_sets[model_name]['y'], y_batch], ignore_index=True)
+                    if last_f1[model_name] is not None:
+                        if (last_f1[model_name] - f1) >= RETRAIN_ON_DROP_THRESH:
+                            do_retrain = True
 
-                    # Limit pamięci (Windowing)
+                if do_retrain:
+                    old_X = training_sets[model_name]['X']
+                    old_y = training_sets[model_name]['y']
+
+                    # === IMPLEMENTACJA FIFO (SLIDING WINDOW) ===
+                    current_X = pd.concat([old_X, X_batch], ignore_index=True)
+                    current_y = pd.concat([old_y, y_batch], ignore_index=True)
+
                     if len(current_X) > WINDOW_SIZE:
-                        current_X = current_X.iloc[-WINDOW_SIZE:]
-                        current_y = current_y.iloc[-WINDOW_SIZE:]
+                        # Ucinamy najstarsze (z początku), zostawiamy najnowsze (na końcu)
+                        current_X = current_X.iloc[-WINDOW_SIZE:].reset_index(drop=True)
+                        current_y = current_y.iloc[-WINDOW_SIZE:].reset_index(drop=True)
 
                     training_sets[model_name]['X'] = current_X
                     training_sets[model_name]['y'] = current_y
+
+                    print(f"\n    [Retrain] {model_name} | batch={i} | train_size={len(current_X)}", end=" ")
 
                     if 'IsolationForest' in model_name:
                         model.fit(current_X)
                     else:
                         model.fit(current_X, current_y)
 
-            # Kropka co 5 batchy, żeby nie śmiecić w konsoli
-            if i % 5 == 0: print(".", end="", flush=True)
-        print(" Done!")
+                    print("Done.")
 
-    # === CZĘŚĆ WIZUALIZACYJNA (Nowa logika) ===
+                last_f1[model_name] = f1
+
+            if i % 5 == 0:
+                print(".", end="", flush=True)
+
+        print(" Stream Done!")
+
     if stream_results:
         df_stream = pd.DataFrame(stream_results)
 
-        # --- TYP 1: Jeden plik na każdy ZBIÓR DANYCH (Porównanie Modeli) ---
-        print("\nGenerowanie wykresów wg ZBIORÓW DANYCH...")
+        # === NOWY KOD: RYSOWANIE WYKRESÓW ===
+        print("\n Generating Datastreams plots")
         unique_streams = df_stream['Test_Stream'].unique()
-
         for stream in unique_streams:
             plt.figure(figsize=(10, 6))
             subset = df_stream[df_stream['Test_Stream'] == stream]
-
             sns.lineplot(data=subset, x='Batch_Idx', y='F1-Score', hue='Model', marker='o')
-
-            plt.title(f'Wyniki dla zbioru: {stream}')
+            plt.title(f'Data: {stream}')
             plt.ylabel('F1 Score')
-            plt.xlabel('Upływ czasu (Batch Index)')
+            plt.xlabel('Batch Index')
             plt.grid(True, alpha=0.3)
-            plt.ylim(0, 1.05)  # Sztywna skala Y, żeby łatwiej porównywać
-
+            plt.ylim(0, 1.05)
             filename = f'plot_stream_by_DATA_{stream}.png'
             plt.savefig(filename)
-            plt.close()  # Ważne: zamykamy wykres, żeby nie nakładał się na następny
-            print(f"  > Zapisano: {filename}")
+            plt.close()
+            print(f" Saved {filename}")
 
-        # --- TYP 2: Jeden plik na każdy MODEL (Porównanie Zbiorów) ---
-        print("\nGenerowanie wykresów wg MODELI...")
+        print("\n Generating Model Plots")
         unique_models = df_stream['Model'].unique()
-
         for model in unique_models:
             plt.figure(figsize=(10, 6))
             subset = df_stream[df_stream['Model'] == model]
-
-            # Tu 'hue' to Test_Stream, bo chcemy widzieć jak model radzi sobie na różnych danych
             sns.lineplot(data=subset, x='Batch_Idx', y='F1-Score', hue='Test_Stream', marker='s')
-
-            plt.title(f'Stabilność modelu: {model}')
+            plt.title(f'Model: {model}')
             plt.ylabel('F1 Score')
-            plt.xlabel('Upływ czasu (Batch Index)')
+            plt.xlabel('Batch Index')
             plt.grid(True, alpha=0.3)
             plt.ylim(0, 1.05)
-
             filename = f'plot_stream_by_MODEL_{model}.png'
             plt.savefig(filename)
             plt.close()
-            print(f"  > Zapisano: {filename}")
+            print(f" Saved {filename}")
 
+        # === NOWY KOD: STATYSTYKI KOŃCOWE ===
+        print("\n" + "=" * 80)
+        print(" S4 STREAM STATISTICS SUMMARY")
+        print("=" * 80)
+
+        for stream in unique_streams:
+            print(f"\nDataset Stream: {stream}")
+            # Nagłówek tabeli
+            print(f"{'Model':<25} | {'Mean F1':<8} | {'Max F1':<8} (Batch) | {'Min F1':<8} (Batch)")
+            print("-" * 75)
+
+            subset_stream = df_stream[df_stream['Test_Stream'] == stream]
+
+            for model in subset_stream['Model'].unique():
+                subset_model = subset_stream[subset_stream['Model'] == model]
+
+                # Obliczenia
+                mean_val = subset_model['F1-Score'].mean()
+
+                # Znalezienie indeksu (wiersza) z max wartością
+                idx_max = subset_model['F1-Score'].idxmax()
+                max_val = subset_model.loc[idx_max, 'F1-Score']
+                batch_max = subset_model.loc[idx_max, 'Batch_Idx']
+
+                # Znalezienie indeksu (wiersza) z min wartością
+                idx_min = subset_model['F1-Score'].idxmin()
+                min_val = subset_model.loc[idx_min, 'F1-Score']
+                batch_min = subset_model.loc[idx_min, 'Batch_Idx']
+
+                # Wypisanie
+                print(
+                    f"{model:<25} | {mean_val:.4f}   | {max_val:.4f}   ({batch_max:>3}) | {min_val:.4f}   ({batch_min:>3})")
+
+        print("=" * 80 + "\n")
 
 def main():
     datasets = load_data()
@@ -322,21 +358,21 @@ def main():
     results = []
 
     # Scenarios 1-3
-    #run_s1_baseline(datasets, results)
-    #run_s2_transfer(datasets, results)
-    #run_s3_combined(datasets, results)
+    run_s1_baseline(datasets, results)
+    run_s2_transfer(datasets, results)
+    run_s3_combined(datasets, results)
 
     # Save S1-S3 Results
-    #results_df = pd.DataFrame(results)
-    # Zapisz pełne wyniki (surowe)
-    #results_df.to_csv('experiment_results_raw.csv', index=False)
+    results_df = pd.DataFrame(results)
+    # Saving raw data
+    results_df.to_csv('experiment_results_raw.csv', index=False)
 
-    # Zapisz wyniki zagregowane (Mean/Std)
-    #summary = results_df.groupby(['Scenario', 'Train_Set', 'Test_Set', 'Model'])['F1-Score'].agg(
-        #['mean', 'std']).reset_index()
-    #summary.to_csv(RESULTS_FILE, index=False)
-    #print(f"\nAggregated results saved to {RESULTS_FILE}")
-    #print(summary.head())
+    # Agregated results (Mean/Std)
+    summary = results_df.groupby(['Scenario', 'Train_Set', 'Test_Set', 'Model'])['F1-Score'].agg(
+        ['mean', 'std']).reset_index()
+    summary.to_csv(RESULTS_FILE, index=False)
+    print(f"\nAggregated results saved to {RESULTS_FILE}")
+    print(summary.head())
 
     # Scenario 4 (Stream)
     run_s4_stream(datasets)
@@ -344,3 +380,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#WYRESY SĄ DLA s4 z podanymi warunkami: RETRAIN_ON_EACH_BATCH = True RETRAIN_INTERVAL = 5 BATCH_SIZE_S4 = 1000 WINDOW_SIZE = 500000 #none or huge number like 500 000
