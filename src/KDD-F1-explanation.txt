@@ -1,15 +1,5 @@
-1. Problem "Jednorodnych Batchy" (Monoclass Batches)Najważniejszą przyczyną jest to, że dane w pliku KDD są prawdopodobnie posortowane
-(np. najpierw 50 tysięcy rekordów ruchu normalnego, potem 10 tysięcy ataku Neptune, potem znowu normalne, itd.).
-Twoja pętla strumienia (run_s4_stream) bierze dane sekwencyjnie (iloc[start:end]), bez wcześniejszego przetasowania (shuffle) zbioru testowego.
-W rezultacie trafiasz na batche, które wyglądają tak:Batch X: 1000 rekordów klasy Normal (0).Batch Y: 1000 rekordów klasy Attack (1).2.
-Matematyka F1-Score (Dlaczego wynik spada do 0?)Gdy model trafia na batch, w którym nie ma ani jednego ataku (same etykiety 0), metryka F1-Score matematycznie "wariuje" lub zeruje się, w zależności od implementacji.
-Wzór na F1 to:$$F1 = \frac{TP}{TP + 0.5(FP + FN)}$$Jeżeli w prawdziwych danych (y_batch) są same zera (brak ataków):
-Liczba True Positive (TP) musi wynosić 0 (bo nie ma czego wykryć).Jeżeli TP = 0, to licznik ułamka wynosi 0.Wynik F1 wynosi 0.0, nawet jeśli model poprawnie przewidział,
- że wszystko jest bezpieczne (True Negative nie jest uwzględniane w liczniku F1).W Twoim kodzie masz f1_score(..., zero_division=0). Dlatego za każdym razem,
- gdy trafiasz na "czysty" ruch sieciowy (batch bez ataków), wykres spada do zera, co widać jako te długie doliny na wykresie.
- 3. Specyfika ataków w KDD (Blocky nature)Zbiór KDD słynie z tego, że ataki występują w ogromnych blokach.
-  Np. atak typu DoS (Smurf, Neptune) generuje tysiące pakietów w krótkim czasie.Gdy wchodzi blok ataku DoS (łatwego do wykrycia),
-  modele mają F1 = 1.0 (górna linia na wykresie).Gdy wchodzi blok ruchu normalnego, F1 spada do 0.0 (z powodu opisanego w pkt 2).
-  Gdy wchodzi trudniejszy atak (np. U2R - User to Root),
-modele mogą mieć realny spadek skuteczności (pośrednie wartości), ale w KDD dominują masowe ataki DoS.
+The main reason why the results for the KDD dataset differ so much from other datasets is how the data is structured and how it is processed. The KDD data is most likely sorted by class, for example long sequences of normal traffic followed by long sequences of a specific attack type such as Neptune, and then normal traffic again. Since the streaming loop (run_s4_stream) processes the test data sequentially using iloc[start:end] and does not shuffle it beforehand, the model often receives batches that contain only a single class. This leads to batches with only normal traffic or only attack traffic.
 
+This directly affects the F1-score. When a batch contains no attacks at all (only label 0), the number of true positives must be zero, because there is nothing to detect. According to the F1 formula, this results in an F1-score of 0.0, even if the model correctly predicts all samples as normal. True negatives are not included in the F1 calculation, and with f1_score(..., zero_division=0) the score is explicitly set to zero in such cases. This is why batches containing only normal traffic produce sharp drops to zero in the F1 plot.
+
+Additionally, the KDD dataset is known for the blocky nature of its attacks. Large-scale attacks such as DoS (e.g., Smurf or Neptune) appear in long, continuous blocks and are relatively easy to detect, often resulting in F1-scores close to 1.0 when such blocks are processed. When the stream switches back to normal traffic, the F1-score drops to 0.0 due to the previously described metric behavior. More difficult attacks, such as U2R, can cause genuine intermediate performance drops, but the dataset is dominated by massive DoS attacks, which makes these sharp oscillations especially visible in KDD compared to other datasets.
