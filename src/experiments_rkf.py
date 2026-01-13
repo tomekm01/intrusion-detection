@@ -19,9 +19,9 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # -----------------------
 DATA_FILES = {
-    "KDD": "./data/processed/processed_kdd.csv",
-    "CORES": "./data/processed/processed_cores.csv",
-    "NETFLOW": "./data/processed/processed_netflow.csv",
+    "KDD": "../data/processed/processed_kdd.csv",
+    "CORES": "../data/processed/processed_cores.csv",
+    "NETFLOW": "../data/processed/processed_netflow.csv",
 }
 
 RESULTS_RAW_FILE = "experiment_results_raw.csv"
